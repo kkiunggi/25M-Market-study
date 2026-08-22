@@ -88,31 +88,75 @@ function tag(block,name){
   const m=block.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${name}>`,`i`));
   return m?decodeXml(m[1].trim()):"";
 }
-function parseGoogleNewsRss(xml){
-  const items=[...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].map(m=>m[1]);
-  return items.map(block=>{
-    const title=tag(block,"title");
-    const source=tag(block,"source") || (title.includes(" - ")?title.split(" - ").at(-1):"News");
-    const rawTitle=title.endsWith(` - ${source}`)?title.slice(0,-(` - ${source}`).length):title;
-    return {title:rawTitle,source,date:tag(block,"pubDate"),url:tag(block,"link")};
-  }).filter(x=>x.title&&x.url);
+function stripHtml(s=""){
+  return decodeXml(s).replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+}
+function parseRss(xml,sourceName){
+  const items=[...xml.matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map(m=>m[1]);
+  return items.map(block=>({
+    title:stripHtml(tag(block,"title")),
+    source:sourceName,
+    date:tag(block,"pubDate")||tag(block,"dc:date")||tag(block,"updated"),
+    url:tag(block,"link")||((block.match(/<link[^>]+href=["']([^"']+)["']/i)||[])[1]||""),
+    description:stripHtml(tag(block,"description")||tag(block,"summary"))
+  })).filter(x=>x.title&&x.url);
 }
 
-const PREFERRED_SOURCES='(site:reuters.com OR site:cnbc.com OR site:investing.com OR site:ft.com OR site:bloomberg.com OR site:marketwatch.com)';
-const DEFAULT_NEWS='("Federal Reserve" OR Treasury OR inflation OR "Bank of Korea" OR "Korean won" OR "S&P 500" OR Nasdaq OR "Brent crude")';
+const NEWS_FEEDS=[
+  {name:"CNBC",url:"https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+  {name:"Financial Times",url:"https://www.ft.com/markets?format=rss"},
+  {name:"Yahoo Finance",url:"https://finance.yahoo.com/rss/topstories"},
+  {name:"Seeking Alpha",url:"https://seekingalpha.com/market_currents.xml"}
+];
+
+async function fetchFeed(feed){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),7000);
+  try{
+    const r=await fetch(feed.url,{signal:controller.signal,headers:{"User-Agent":"Mozilla/5.0 (compatible; 25M-Markets/1.0)","Accept":"application/rss+xml,application/xml,text/xml,*/*"}});
+    if(!r.ok) throw new Error(`${feed.name} ${r.status}`);
+    return {name:feed.name,ok:true,articles:parseRss(await r.text(),feed.name)};
+  }catch(e){return {name:feed.name,ok:false,error:e.message,articles:[]}}
+  finally{clearTimeout(timer)}
+}
+
+function tokenize(q=""){
+  return q.toLowerCase().replace(/[^a-z0-9가-힣\s]/g," ").split(/\s+/).filter(x=>x.length>2&&!['the','and','for','with','from','that','market','markets'].includes(x));
+}
+function articleScore(article,tokens){
+  if(!tokens.length)return 0;
+  const text=(article.title+" "+article.description).toLowerCase();
+  return tokens.reduce((s,t)=>s+(text.includes(t)?1:0),0);
+}
+
+let newsCache={t:0,results:null};
+async function allNews(){
+  if(newsCache.results&&Date.now()-newsCache.t<5*60*1000)return newsCache.results;
+  const results=await Promise.all(NEWS_FEEDS.map(fetchFeed));
+  newsCache={t:Date.now(),results};
+  return results;
+}
 
 app.get("/api/news",async(req,res)=>{
   const asset=String(req.query.asset||"").trim().slice(0,240);
-  const topic=asset||DEFAULT_NEWS;
-  const q=`${topic} ${PREFERRED_SOURCES} when:2d`;
-  const url=`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`;
   try{
-    const r=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0 25M-Markets/1.0","Accept":"application/rss+xml, application/xml, text/xml"}});
-    if(!r.ok) throw new Error(`Google News RSS ${r.status}`);
-    const articles=parseGoogleNewsRss(await r.text()).slice(0,24);
-    res.json({ok:true,provider:"Google News RSS",articles});
+    const feeds=await allNews();
+    let articles=feeds.flatMap(x=>x.articles);
+    const tokens=tokenize(asset);
+    if(tokens.length){
+      articles=articles.map(a=>({...a,_score:articleScore(a,tokens)})).filter(a=>a._score>0).sort((a,b)=>b._score-a._score);
+    }
+    articles=articles.sort((a,b)=>{
+      const da=Date.parse(a.date)||0,db=Date.parse(b.date)||0;
+      return db-da;
+    }).slice(0,24).map(({_score,...a})=>a);
+    const sources=feeds.map(x=>({name:x.name,ok:x.ok,error:x.error||null,count:x.articles.length}));
+    if(!articles.length && !asset){
+      return res.status(502).json({ok:false,error:"All direct RSS feeds returned no articles.",provider:"Direct RSS",sources,articles:[]});
+    }
+    res.json({ok:true,provider:"Direct RSS",sources,articles});
   }catch(e){
-    res.status(502).json({ok:false,error:e.message,provider:"Google News RSS",articles:[]});
+    res.status(502).json({ok:false,error:e.message,provider:"Direct RSS",articles:[]});
   }
 });
 
